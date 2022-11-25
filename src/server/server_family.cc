@@ -104,14 +104,13 @@ string UnknownCmd(string cmd, CmdArgList args) {
 
 string InferLoadFile(fs::path data_dir) {
   const auto& dbname = GetFlag(FLAGS_dbfilename);
-
   if (dbname.empty())
     return string{};
 
   fs::path fl_path = data_dir.append(dbname);
-
   if (fs::exists(fl_path))
     return fl_path.generic_string();
+
   if (!fl_path.has_extension()) {
     std::string glob = absl::StrCat(fl_path.generic_string(), "*");
     io::Result<io::StatShortVec> short_vec = io::StatFiles(glob);
@@ -125,7 +124,6 @@ string InferLoadFile(fs::path data_dir) {
     } else {
       LOG(WARNING) << "Could not stat " << glob << ", error " << short_vec.error().message();
     }
-    LOG(INFO) << "Checking " << fl_path;
   }
   return string{};
 }
@@ -197,6 +195,8 @@ class RdbSnapshot {
   std::unique_ptr<io::Sink> io_sink_;
   std::unique_ptr<RdbSaver> saver_;
   RdbTypeFreqMap freq_map_;
+
+  Cancellation cll_{};
 };
 
 io::Result<size_t> LinuxWriteWrapper::WriteSome(const iovec* v, uint32_t len) {
@@ -231,7 +231,7 @@ error_code RdbSnapshot::Start(SaveMode save_mode, const std::string& path,
 }
 
 error_code RdbSnapshot::SaveBody() {
-  return saver_->SaveBody(&freq_map_);
+  return saver_->SaveBody(&cll_, &freq_map_);
 }
 
 error_code RdbSnapshot::Close() {
@@ -243,7 +243,7 @@ error_code RdbSnapshot::Close() {
 }
 
 void RdbSnapshot::StartInShard(EngineShard* shard) {
-  saver_->StartSnapshotInShard(false, shard);
+  saver_->StartSnapshotInShard(false, &cll_, shard);
   started_ = true;
 }
 
@@ -369,18 +369,19 @@ void ServerFamily::Init(util::AcceptServer* acceptor, util::ListenerInterface* m
   fs::path data_folder = fs::current_path();
   const auto& dir = GetFlag(FLAGS_dir);
 
+  error_code file_ec;
   if (!dir.empty()) {
-    data_folder = dir;
-
-    error_code ec;
-
-    data_folder = fs::canonical(data_folder, ec);
+    data_folder = fs::canonical(dir, file_ec);
   }
 
-  LOG(INFO) << "Data directory is " << data_folder;
-  string load_path = InferLoadFile(data_folder);
-  if (!load_path.empty()) {
-    load_result_ = Load(load_path);
+  if (!file_ec) {
+    LOG(INFO) << "Data directory is " << data_folder;
+    string load_path = InferLoadFile(data_folder);
+    if (!load_path.empty()) {
+      load_result_ = Load(load_path);
+    }
+  } else {
+    LOG(ERROR) << "Data directory error: " << file_ec.message();
   }
 
   string save_time = GetFlag(FLAGS_save_schedule);
@@ -388,9 +389,7 @@ void ServerFamily::Init(util::AcceptServer* acceptor, util::ListenerInterface* m
     std::optional<SnapshotSpec> spec = ParseSaveSchedule(save_time);
     if (spec) {
       snapshot_fiber_ = service_.proactor_pool().GetNextProactor()->LaunchFiber(
-          [save_spec = std::move(spec.value()), this] {
-            SnapshotScheduling(std::move(save_spec));
-          });
+          [save_spec = std::move(spec.value()), this] { SnapshotScheduling(save_spec); });
     } else {
       LOG(WARNING) << "Invalid snapshot time specifier " << save_time;
     }
@@ -520,7 +519,7 @@ fibers::future<std::error_code> ServerFamily::Load(const std::string& load_path)
   return ec_future;
 }
 
-void ServerFamily::SnapshotScheduling(const SnapshotSpec&& spec) {
+void ServerFamily::SnapshotScheduling(const SnapshotSpec& spec) {
   const auto loop_sleep_time = std::chrono::seconds(20);
   while (true) {
     if (is_snapshot_done_.WaitFor(loop_sleep_time)) {
@@ -544,16 +543,14 @@ void ServerFamily::SnapshotScheduling(const SnapshotSpec&& spec) {
       continue;
     }
 
-    // do the save
-    string err_details;
-    error_code ec;
     const CommandId* cid = service().FindCmd("SAVE");
     CHECK_NOTNULL(cid);
     boost::intrusive_ptr<Transaction> trans(new Transaction{cid});
     trans->InitByArgs(0, {});
-    ec = DoSave(false, trans.get(), &err_details);
+
+    GenericError ec = DoSave(false, trans.get());
     if (ec) {
-      LOG(WARNING) << "Failed to perform snapshot " << err_details;
+      LOG(WARNING) << "Failed to perform snapshot " << ec.Format();
     }
   }
 }
@@ -784,11 +781,14 @@ static void RunStage(bool new_version, std::function<void(unsigned)> cb) {
   }
 };
 
+using PartialSaveOpts =
+    tuple<const string& /*filename*/, const string& /*path*/, absl::Time /*start*/>;
+
 // Start saving a single snapshot of a multi-file dfly snapshot.
 // If shard is null, then this is the summary file.
-error_code DoPartialSave(const string& filename, const string& path, absl::Time now,
-                         const dfly::StringVec& scripts, RdbSnapshot* snapshot,
-                         EngineShard* shard) {
+error_code DoPartialSave(PartialSaveOpts opts, const dfly::StringVec& scripts,
+                         RdbSnapshot* snapshot, EngineShard* shard) {
+  auto [filename, path, now] = opts;
   // Construct resulting filename.
   fs::path file = filename, abs_path = path;
   if (shard == nullptr) {
@@ -796,7 +796,7 @@ error_code DoPartialSave(const string& filename, const string& path, absl::Time 
   } else {
     ExtendFilenameWithShard(now, shard->shard_id(), &file);
   }
-  abs_path += file;
+  abs_path /= file;  // use / operator to concatenate paths.
   VLOG(1) << "Saving partial file to " << abs_path;
 
   // Start rdb saving.
@@ -810,24 +810,22 @@ error_code DoPartialSave(const string& filename, const string& path, absl::Time 
   return local_ec;
 }
 
-error_code ServerFamily::DoSave(bool new_version, Transaction* trans, string* err_details) {
+GenericError ServerFamily::DoSave(bool new_version, Transaction* trans) {
   fs::path dir_path(GetFlag(FLAGS_dir));
-  AggregateError ec;
+  AggregateGenericError ec;
 
   // Check directory.
   if (!dir_path.empty()) {
-    ec = CreateDirs(dir_path);
-    if (ec) {
-      *err_details = "create-dir ";
-      return *ec;
+    if (auto local_ec = CreateDirs(dir_path); local_ec) {
+      return {local_ec, "create-dir"};
     }
   }
 
   // Manage global state.
   GlobalState new_state = service_.SwitchState(GlobalState::ACTIVE, GlobalState::SAVING);
   if (new_state != GlobalState::SAVING) {
-    *err_details = StrCat(GlobalStateName(new_state), " - can not save database");
-    return make_error_code(errc::operation_in_progress);
+    return {make_error_code(errc::operation_in_progress),
+            StrCat(GlobalStateName(new_state), " - can not save database")};
   }
   absl::Cleanup rev_state = [this] {
     service_.SwitchState(GlobalState::SAVING, GlobalState::ACTIVE);
@@ -837,9 +835,8 @@ error_code ServerFamily::DoSave(bool new_version, Transaction* trans, string* er
   fs::path filename = dbfilename.empty() ? "dump" : dbfilename;
   fs::path path = dir_path;
 
-  auto start = absl::Now();
+  absl::Time start = absl::Now();
   shared_ptr<LastSaveInfo> save_info;
-  absl::Time now = absl::Now();
 
   vector<unique_ptr<RdbSnapshot>> snapshots;
   absl::flat_hash_map<string_view, size_t> rdb_name_map;
@@ -866,17 +863,20 @@ error_code ServerFamily::DoSave(bool new_version, Transaction* trans, string* er
 
   // Start snapshots.
   if (new_version) {
+    auto file_opts = make_tuple(cref(filename), cref(path), start);
+
     // In the new version (.dfs) we store a file for every shard and one more summary file.
     // Summary file is always last in snapshots array.
     snapshots.resize(shard_set->size() + 1);
 
     // Save summary file.
     {
-      const auto& scripts = script_mgr_->GetLuaScripts();
-      auto& summary_snapshot = snapshots[shard_set->size()];
-      summary_snapshot.reset(new RdbSnapshot(fq_threadpool_.get()));
-      if (ec = DoPartialSave(filename, path, now, scripts, summary_snapshot.get(), nullptr)) {
-        summary_snapshot.reset();
+      const auto scripts = script_mgr_->GetLuaScripts();
+      auto& snapshot = snapshots[shard_set->size()];
+      snapshot.reset(new RdbSnapshot(fq_threadpool_.get()));
+      if (auto local_ec = DoPartialSave(file_opts, scripts, snapshot.get(), nullptr); local_ec) {
+        ec = local_ec;
+        snapshot.reset();
       }
     }
 
@@ -884,7 +884,8 @@ error_code ServerFamily::DoSave(bool new_version, Transaction* trans, string* er
     auto cb = [&](Transaction* t, EngineShard* shard) {
       auto& snapshot = snapshots[shard->shard_id()];
       snapshot.reset(new RdbSnapshot(fq_threadpool_.get()));
-      if (ec = DoPartialSave(filename, path, now, {}, snapshot.get(), shard)) {
+      if (auto local_ec = DoPartialSave(file_opts, {}, snapshot.get(), shard); local_ec) {
+        ec = local_ec;
         snapshot.reset();
       }
       return OpStatus::OK;
@@ -894,28 +895,30 @@ error_code ServerFamily::DoSave(bool new_version, Transaction* trans, string* er
   } else {
     snapshots.resize(1);
 
-    ExtendFilenameWithShard(now, -1, &filename);
-    path += filename;
+    ExtendFilenameWithShard(start, -1, &filename);
+    path /= filename;  // use / operator to concatenate paths.
     VLOG(1) << "Saving to " << path;
 
     snapshots[0].reset(new RdbSnapshot(fq_threadpool_.get()));
-    const auto& lua_scripts = script_mgr_->GetLuaScripts();
+    const auto lua_scripts = script_mgr_->GetLuaScripts();
     ec = snapshots[0]->Start(SaveMode::RDB, path.generic_string(), lua_scripts);
 
     if (!ec) {
       auto cb = [&](Transaction* t, EngineShard* shard) {
         snapshots[0]->StartInShard(shard);
-
         return OpStatus::OK;
       };
 
       trans->ScheduleSingleHop(std::move(cb));
+    } else {
+      snapshots[0].reset();
     }
   }
 
   is_saving_.store(true, memory_order_relaxed);
 
   // Perform snapshot serialization, block the current fiber until it completes.
+  // TODO: Add cancellation in case of error.
   RunStage(new_version, save_cb);
 
   is_saving_.store(false, memory_order_relaxed);
@@ -923,13 +926,14 @@ error_code ServerFamily::DoSave(bool new_version, Transaction* trans, string* er
   RunStage(new_version, close_cb);
 
   if (new_version) {
-    ExtendFilename(now, "summary", &filename);
-    path += filename;
+    ExtendFilename(start, "summary", &filename);
+    path /= filename;
   }
 
+  absl::Duration dur = absl::Now() - start;
+  double seconds = double(absl::ToInt64Milliseconds(dur)) / 1000;
+
   {
-    absl::Duration dur = absl::Now() - start;
-    double seconds = double(absl::ToInt64Milliseconds(dur)) / 1000;
     LOG(INFO) << "Saving " << path << " finished after "
               << strings::HumanReadableElapsedTime(seconds);
   }
@@ -941,18 +945,20 @@ error_code ServerFamily::DoSave(bool new_version, Transaction* trans, string* er
       save_info->freq_map.emplace_back(k_v);
     }
 
-    save_info->save_time = absl::ToUnixSeconds(now);
+    save_info->save_time = absl::ToUnixSeconds(start);
     save_info->file_name = path.generic_string();
+    save_info->duration_sec = uint32_t(seconds);
 
     lock_guard lk(save_mu_);
     // swap - to deallocate the old version outstide of the lock.
     last_save_info_.swap(save_info);
   }
+
   return *ec;
 }
 
-error_code ServerFamily::DoFlush(Transaction* transaction, DbIndex db_ind) {
-  VLOG(1) << "DoFlush";
+error_code ServerFamily::Drakarys(Transaction* transaction, DbIndex db_ind) {
+  VLOG(1) << "Drakarys";
 
   transaction->Schedule();  // TODO: to convert to ScheduleSingleHop ?
 
@@ -990,7 +996,7 @@ void ServerFamily::BreakOnShutdown() {
 
 void ServerFamily::FlushDb(CmdArgList args, ConnectionContext* cntx) {
   DCHECK(cntx->transaction);
-  DoFlush(cntx->transaction, cntx->transaction->db_index());
+  Drakarys(cntx->transaction, cntx->transaction->db_index());
   cntx->reply_builder()->SendOk();
 }
 
@@ -1001,7 +1007,7 @@ void ServerFamily::FlushAll(CmdArgList args, ConnectionContext* cntx) {
   }
 
   DCHECK(cntx->transaction);
-  DoFlush(cntx->transaction, DbSlice::kDbAll);
+  Drakarys(cntx->transaction, DbSlice::kDbAll);
   (*cntx)->SendOk();
 }
 
@@ -1036,6 +1042,15 @@ void ServerFamily::Client(CmdArgList args, ConnectionContext* cntx) {
   if (sub_cmd == "SETNAME" && args.size() == 3) {
     cntx->owner()->SetName(ArgS(args, 2));
     return (*cntx)->SendOk();
+  }
+
+  if (sub_cmd == "GETNAME") {
+    const char* name = cntx->owner()->GetName();
+    if (*name != 0) {
+      return (*cntx)->SendBulkString(name);
+    } else {
+      return (*cntx)->SendNull();
+    }
   }
 
   if (sub_cmd == "LIST") {
@@ -1116,10 +1131,9 @@ void ServerFamily::Save(CmdArgList args, ConnectionContext* cntx) {
     }
   }
 
-  error_code ec = DoSave(new_version, cntx->transaction, &err_detail);
-
+  GenericError ec = DoSave(new_version, cntx->transaction);
   if (ec) {
-    (*cntx)->SendError(absl::StrCat(err_detail, ec.message()));
+    (*cntx)->SendError(ec.Format());
   } else {
     (*cntx)->SendOk();
   }
@@ -1313,8 +1327,11 @@ void ServerFamily::Info(CmdArgList args, ConnectionContext* cntx) {
       lock_guard lk(save_mu_);
       save_info = last_save_info_;
     }
+    // when when last save
     append("last_save", save_info->save_time);
+    append("last_save_duration_sec", save_info->duration_sec);
     append("last_save_file", save_info->file_name);
+
     for (const auto& k_v : save_info->freq_map) {
       append(StrCat("rdb_", k_v.first), k_v.second);
     }
@@ -1471,6 +1488,12 @@ void ServerFamily::ReplicaOf(CmdArgList args, ConnectionContext* cntx) {
 
   replica_.swap(new_replica);
 
+  GlobalState new_state = service_.SwitchState(GlobalState::ACTIVE, GlobalState::LOADING);
+  if (new_state != GlobalState::LOADING) {
+    LOG(WARNING) << GlobalStateName(new_state) << " in progress, ignored";
+    return;
+  }
+
   // Flushing all the data after we marked this instance as replica.
   Transaction* transaction = cntx->transaction;
   transaction->Schedule();
@@ -1483,7 +1506,8 @@ void ServerFamily::ReplicaOf(CmdArgList args, ConnectionContext* cntx) {
 
   // Replica sends response in either case. No need to send response in this function.
   // It's a bit confusing but simpler.
-  if (!replica_->Run(cntx)) {
+  if (!replica_->Start(cntx)) {
+    service_.SwitchState(GlobalState::LOADING, GlobalState::ACTIVE);
     replica_.reset();
   }
 

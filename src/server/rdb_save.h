@@ -72,7 +72,7 @@ class RdbSaver {
 
   // Initiates the serialization in the shard's thread.
   // TODO: to implement break functionality to allow stopping early.
-  void StartSnapshotInShard(bool stream_journal, EngineShard* shard);
+  void StartSnapshotInShard(bool stream_journal, const Cancellation* cll, EngineShard* shard);
 
   // Stops serialization in journal streaming mode in the shard's thread.
   void StopSnapshotInShard(EngineShard* shard);
@@ -83,9 +83,13 @@ class RdbSaver {
   // Writes the RDB file into sink. Waits for the serialization to finish.
   // Fills freq_map with the histogram of rdb types.
   // freq_map can optionally be null.
-  std::error_code SaveBody(RdbTypeFreqMap* freq_map);
+  std::error_code SaveBody(const Cancellation* cll, RdbTypeFreqMap* freq_map);
 
-  SaveMode Mode() const { return save_mode_; }
+  void Cancel();
+
+  SaveMode Mode() const {
+    return save_mode_;
+  }
 
  private:
   class Impl;
@@ -139,6 +143,8 @@ class RdbSerializer {
   // this by finding the key. This function is used
   // for the dump command - thus it is public function
   std::error_code SaveValue(const PrimeValue& pv);
+
+  std::error_code SendFullSyncCut();
 
  private:
   std::error_code SaveLzfBlob(const ::io::Bytes& src, size_t uncompressed_len);

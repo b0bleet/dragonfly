@@ -4,11 +4,12 @@
 
 #pragma once
 
-#include <boost/fiber/mutex.hpp>
 #include <absl/strings/ascii.h>
 #include <absl/strings/str_cat.h>
 #include <absl/types/span.h>
 
+#include <atomic>
+#include <boost/fiber/mutex.hpp>
 #include <string_view>
 #include <vector>
 
@@ -32,6 +33,7 @@ using facade::ArgS;
 using facade::CmdArgList;
 using facade::CmdArgVec;
 using facade::MutableSlice;
+using facade::OpResult;
 
 using ArgSlice = absl::Span<const std::string_view>;
 using StringVec = std::vector<std::string>;
@@ -195,5 +197,90 @@ using AggregateError = AggregateValue<std::error_code>;
 using AggregateStatus = AggregateValue<facade::OpStatus>;
 static_assert(facade::OpStatus::OK == facade::OpStatus{},
               "Default intitialization should be OK value");
+
+// Re-usable component for signaling cancellation.
+// Simple wrapper around atomic flag.
+struct Cancellation {
+  void Cancel() {
+    flag_.store(true, std::memory_order_relaxed);
+  }
+
+  bool IsCancelled() const {
+    return flag_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic_bool flag_;
+};
+
+// Error wrapper, that stores error_code and optional string message.
+class GenericError {
+ public:
+  GenericError() = default;
+  GenericError(std::error_code ec) : ec_{ec}, details_{} {
+  }
+  GenericError(std::error_code ec, std::string details) : ec_{ec}, details_{std::move(details)} {
+  }
+
+  std::error_code GetError() const {
+    return ec_;
+  }
+
+  const std::string& GetDetails() const {
+    return details_;
+  }
+
+  operator bool() const {
+    return bool(ec_);
+  }
+
+  // Get string representation of error.
+  std::string Format() const;
+
+ private:
+  std::error_code ec_;
+  std::string details_;
+};
+
+using AggregateGenericError = AggregateValue<GenericError>;
+
+// Contest combines Cancellation and AggregateGenericError in one class.
+// Allows setting an error_handler to run on errors.
+class Context : public Cancellation {
+ public:
+  // The error handler should return false if this error is ignored.
+  using ErrHandler = std::function<bool(const GenericError&)>;
+
+  Context() = default;
+  Context(ErrHandler err_handler) : Cancellation{}, err_handler_{std::move(err_handler)} {
+  }
+
+  template <typename... T> void Error(T... ts) {
+    std::lock_guard lk{mu_};
+    if (err_)
+      return;
+
+    GenericError new_err{std::forward<T>(ts)...};
+    if (!err_handler_ || err_handler_(new_err)) {
+      err_ = std::move(new_err);
+      Cancel();
+    }
+  }
+
+ private:
+  GenericError err_;
+  ErrHandler err_handler_;
+  ::boost::fibers::mutex mu_;
+};
+
+struct ScanOpts {
+  std::string_view pattern;
+  size_t limit = 10;
+  std::string_view type_filter;
+  unsigned bucket_id = UINT_MAX;
+
+  bool Matches(std::string_view val_name) const;
+  static OpResult<ScanOpts> TryFrom(CmdArgList args);
+};
 
 }  // namespace dfly

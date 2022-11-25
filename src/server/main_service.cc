@@ -42,9 +42,6 @@ using namespace std;
 
 ABSL_FLAG(uint32_t, port, 6379, "Redis port");
 ABSL_FLAG(uint32_t, memcache_port, 0, "Memcached port");
-ABSL_FLAG(uint64_t, maxmemory, 0,
-          "Limit on maximum-memory that is used by the database."
-          "0 - means the program will automatically determine its maximum memory usage");
 
 ABSL_DECLARE_FLAG(string, requirepass);
 
@@ -72,6 +69,24 @@ DEFINE_VARZ(VarzMapAverage, request_latency_usec);
 std::optional<VarzFunction> engine_varz;
 
 constexpr size_t kMaxThreadSize = 1024;
+
+// Unwatch all keys for a connection and unregister from DbSlices.
+// Used by UNWATCH, DICARD and EXEC.
+void UnwatchAllKeys(ConnectionContext* cntx) {
+  auto& exec_info = cntx->conn_state.exec_info;
+  if (!exec_info.watched_keys.empty()) {
+    auto cb = [&](EngineShard* shard) {
+      shard->db_slice().UnregisterConnectionWatches(&exec_info);
+    };
+    shard_set->RunBriefInParallel(std::move(cb));
+  }
+  exec_info.ClearWatched();
+}
+
+void MultiCleanup(ConnectionContext* cntx) {
+  UnwatchAllKeys(cntx);
+  cntx->conn_state.exec_info.Clear();
+}
 
 void DeactivateMonitoring(ConnectionContext* server_ctx) {
   if (server_ctx->monitor) {
@@ -602,6 +617,15 @@ void Service::DispatchCommand(CmdArgList args, facade::ConnectionContext* cntx) 
   etl.connection_stats.cmd_count_map[cmd_name]++;
 
   if (dfly_cntx->conn_state.exec_info.IsActive() && !is_trans_cmd) {
+    auto cmd_name = ArgS(args, 0);
+    if (cmd_name == "EVAL" || cmd_name == "EVALSHA") {
+      auto error =
+          absl::StrCat("'", cmd_name,
+                       "' Dragonfly does not allow execution of a server-side Lua script inside "
+                       "transaction block");
+      MultiSetError(dfly_cntx);
+      return (*cntx)->SendError(error);
+    }
     // TODO: protect against aggregating huge transactions.
     StoredCmd stored_cmd{cid};
     stored_cmd.cmd.reserve(args.size());
@@ -632,8 +656,10 @@ void Service::DispatchCommand(CmdArgList args, facade::ConnectionContext* cntx) 
           return (*cntx)->SendError("script tried accessing undeclared key");
         }
       }
+
       dfly_cntx->transaction->SetExecCmd(cid);
       OpStatus st = dfly_cntx->transaction->InitByArgs(dfly_cntx->conn_state.db_index, args);
+
       if (st != OpStatus::OK) {
         return (*cntx)->SendError(st);
       }
@@ -881,19 +907,6 @@ void Service::Watch(CmdArgList args, ConnectionContext* cntx) {
   return (*cntx)->SendOk();
 }
 
-// Unwatch all keys for a connection and unregister from DbSlices.
-// Used by UNWATCH, DICARD and EXEC.
-void UnwatchAllKeys(ConnectionContext* cntx) {
-  auto& exec_info = cntx->conn_state.exec_info;
-  if (!exec_info.watched_keys.empty()) {
-    auto cb = [&](EngineShard* shard) {
-      shard->db_slice().UnregisterConnectionWatches(&exec_info);
-    };
-    shard_set->RunBriefInParallel(std::move(cb));
-  }
-  exec_info.ClearWatched();
-}
-
 void Service::Unwatch(CmdArgList args, ConnectionContext* cntx) {
   UnwatchAllKeys(cntx);
   return (*cntx)->SendOk();
@@ -1050,8 +1063,7 @@ void Service::Discard(CmdArgList args, ConnectionContext* cntx) {
     return rb->SendError("DISCARD without MULTI");
   }
 
-  UnwatchAllKeys(cntx);
-  cntx->conn_state.exec_info.Clear();
+  MultiCleanup(cntx);
   rb->SendOk();
 }
 
@@ -1108,10 +1120,7 @@ void Service::Exec(CmdArgList args, ConnectionContext* cntx) {
   }
 
   auto& exec_info = cntx->conn_state.exec_info;
-  absl::Cleanup exec_clear = [&cntx, &exec_info] {
-    UnwatchAllKeys(cntx);
-    exec_info.Clear();
-  };
+  absl::Cleanup exec_clear = [&cntx] { MultiCleanup(cntx); };
 
   if (IsWatchingOtherDbs(cntx->db_index(), exec_info)) {
     return rb->SendError("Dragonfly does not allow WATCH and EXEC on different databases");
@@ -1154,7 +1163,7 @@ void Service::Exec(CmdArgList args, ConnectionContext* cntx) {
         }
       }
       scmd.descr->Invoke(cmd_arg_list, cntx);
-      if (rb->GetError())
+      if (rb->GetError())  // checks for i/o error, not logical error.
         break;
     }
 
@@ -1167,12 +1176,15 @@ void Service::Exec(CmdArgList args, ConnectionContext* cntx) {
 
 void Service::Publish(CmdArgList args, ConnectionContext* cntx) {
   string_view channel = ArgS(args, 1);
-  string_view message = ArgS(args, 2);
+
+  // shared_ptr ensures that the message lives until it's been sent to all subscribers and handled
+  // by DispatchOperations.
+  std::shared_ptr<const std::string> message = std::make_shared<const std::string>(ArgS(args, 2));
   ShardId sid = Shard(channel, shard_count());
 
   auto cb = [&] { return EngineShard::tlocal()->channel_slice().FetchSubscribers(channel); };
 
-  // How do we know that subsribers did not disappear after we fetched them?
+  // How do we know that subscribers did not disappear after we fetched them?
   // Each subscriber object hold a borrow_token.
   // OnClose does not reset subscribe_info before all tokens are returned.
   vector<ChannelSlice::Subscriber> subscriber_arr = shard_set->Await(sid, std::move(cb));
@@ -1189,10 +1201,8 @@ void Service::Publish(CmdArgList args, ConnectionContext* cntx) {
       }
     }
 
-    fibers_ext::BlockingCounter bc(subscriber_arr.size());
-
-    // We run publish_cb in each subsriber's thread.
-    auto publish_cb = [&, bc](unsigned idx, util::ProactorBase*) mutable {
+    // We run publish_cb in each subscriber's thread.
+    auto publish_cb = [&](unsigned idx, util::ProactorBase*) mutable {
       unsigned start = slices[idx];
 
       for (unsigned i = start; i < subscriber_arr.size(); ++i) {
@@ -1208,13 +1218,11 @@ void Service::Publish(CmdArgList args, ConnectionContext* cntx) {
         pmsg.channel = channel;
         pmsg.message = message;
         pmsg.pattern = subscriber.pattern;
-        conn->SendMsgVecAsync(pmsg, bc);
+        conn->SendMsgVecAsync(pmsg);
       }
     };
 
     shard_set->pool()->Await(publish_cb);
-
-    bc.Wait();  // Wait for all the messages to be sent.
   }
 
   // If subscriber connections are closing they will wait

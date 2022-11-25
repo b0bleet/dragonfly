@@ -157,7 +157,7 @@ with respect to Memcached and Redis APIs.
   - [X] WATCH
   - [X] UNWATCH
   - [X] DISCARD
-  - [X] CLIENT LIST/SETNAME
+  - [X] CLIENT LIST/SETNAME/GETNAME
   - [ ] CLIENT KILL/UNPAUSE/PAUSE/GETNAME/REPLY/TRACKINGINFO
   - [X] COMMAND
   - [X] COMMAND COUNT
@@ -172,7 +172,7 @@ with respect to Memcached and Redis APIs.
 - [X] Generic Family
   - [X] SCAN
   - [X] PEXPIREAT
-  - [ ] PEXPIRE
+  - [X] PEXPIRE
   - [x] DUMP
   - [X] EVAL
   - [X] EVALSHA
